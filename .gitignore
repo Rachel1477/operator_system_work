@@ -1,0 +1,22 @@
+# 编译产物
+*.o
+*.out
+myfs
+
+# 虚拟磁盘文件
+disk.bin
+
+# 测试文件
+simple_test.txt
+
+# 编辑器临时文件
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
