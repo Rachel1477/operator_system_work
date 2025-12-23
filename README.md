@@ -66,7 +66,7 @@ operator_system_majorwork3/
 └── disk.bin           # 虚拟磁盘文件（运行后生成）
 ```
 
-## 编译和运行
+## 快速开始
 
 ### 环境要求
 - Linux 系统（推荐 Ubuntu/Debian）
@@ -83,16 +83,6 @@ make
 ./myfs
 ```
 
-或者直接：
-```bash
-make run
-```
-
-### 清理编译文件
-```bash
-make clean        # 清理 .o 文件和可执行文件
-make distclean    # 完全清理（包括 disk.bin）
-```
 
 ## 使用指南
 
@@ -146,6 +136,7 @@ info
 # 退出
 exit
 ```
+
 
 ### 3. 权限说明
 
@@ -219,7 +210,7 @@ write file.txt   # 写入内容
 cat file.txt     # 读取内容
 ls               # 列出文件
 ```
-
+![pic1](assert/1.png)
 ### 场景 2：权限测试
 ```bash
 # 以 root 登录
@@ -232,7 +223,7 @@ logout
 login
 cat private.txt        # 应该失败（权限不足）
 ```
-
+![pic2](assert/2.png)
 ### 场景 3：多用户并发（需要多个终端）
 ```bash
 # 终端 1（读者）
@@ -247,7 +238,7 @@ write large_file.txt   # 等待终端1读取完成
 login
 cat large_file.txt     # 如果终端2还在写，则等待
 ```
-
+![pic3](assert/3.png)
 ## 课程设计要点对应
 
 ### 要求 1：解读部分 Linux 文件系统源码
