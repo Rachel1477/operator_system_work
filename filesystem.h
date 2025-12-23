@@ -28,6 +28,12 @@ enum FileType {
     FILE_TYPE_DIRECTORY = 1 // 目录
 };
 
+// ============= 文件状态（用于跨进程写锁）=============
+enum FileState {
+    FILE_STATE_AVAILABLE = 0,  // 可用
+    FILE_STATE_WRITING = 1     // 正在写入
+};
+
 // ============= 权限位定义 =============
 const uint16_t PERM_READ = 0x04;   // r--
 const uint16_t PERM_WRITE = 0x02;  // -w-
@@ -83,6 +89,7 @@ struct SuperBlock {
 struct Inode {
     uint32_t inode_id;                  // Inode 编号
     uint8_t file_type;                  // 文件类型（普通文件/目录）
+    uint8_t state;                      // 文件状态（用于跨进程写锁）
     uint16_t permission;                // 权限（rwx）
     uint16_t owner_id;                  // 所有者 UID
     uint32_t file_size;                 // 文件大小（字节）
@@ -91,11 +98,12 @@ struct Inode {
     uint32_t indirect_block;            // 一级间接块指针
     uint32_t create_time;               // 创建时间
     uint32_t modify_time;               // 修改时间
-    char padding[36];                   // 填充到 128 字节
+    char padding[35];                   // 填充到 128 字节（减少1字节给state）
 
     Inode() {
         inode_id = 0;
         file_type = FILE_TYPE_REGULAR;
+        state = FILE_STATE_AVAILABLE;
         permission = DEFAULT_FILE_PERM;
         owner_id = 0;
         file_size = 0;
@@ -236,6 +244,14 @@ public:
     
     bool writeFile(const std::string& filename, const std::string& content);
     std::string readFile(const std::string& filename);
+    // 写锁控制（供 Shell 在交互式写入前先获取/释放写锁）
+    bool lockFileForWrite(const std::string& filename);
+    void unlockFileForWrite(const std::string& filename);
+    bool writeFileLocked(const std::string& filename, const std::string& content);
+    
+    // 跨进程写锁（基于磁盘状态）
+    bool beginWrite(uint32_t inode_id);
+    void endWrite(uint32_t inode_id);
     
     // 目录操作
     bool changeDirectory(const std::string& path);

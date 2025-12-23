@@ -620,15 +620,16 @@ void FileSystem::acquireReadLock(uint32_t inode_id) {
 }
 
 void FileSystem::releaseReadLock(uint32_t inode_id) {
-    std::lock_guard<std::mutex> lock(open_files_mutex);
+    std::unique_lock<std::mutex> lock(open_files_mutex);
     
     if (open_files.find(inode_id) == open_files.end()) {
         return;
     }
     
-    auto& entry = open_files[inode_id];
-    std::lock_guard<std::mutex> file_lock(entry->mutex);
+    auto entry = open_files[inode_id];
+    lock.unlock();  // 先释放 open_files_mutex
     
+    std::lock_guard<std::mutex> file_lock(entry->mutex);
     entry->reader_count--;
     if (entry->reader_count == 0) {
         entry->cv.notify_all(); // 唤醒等待的写者
@@ -655,15 +656,16 @@ void FileSystem::acquireWriteLock(uint32_t inode_id) {
 }
 
 void FileSystem::releaseWriteLock(uint32_t inode_id) {
-    std::lock_guard<std::mutex> lock(open_files_mutex);
+    std::unique_lock<std::mutex> lock(open_files_mutex);
     
     if (open_files.find(inode_id) == open_files.end()) {
         return;
     }
     
-    auto& entry = open_files[inode_id];
-    std::lock_guard<std::mutex> file_lock(entry->mutex);
+    auto entry = open_files[inode_id];
+    lock.unlock();  // 先释放 open_files_mutex
     
+    std::lock_guard<std::mutex> file_lock(entry->mutex);
     entry->is_writing = false;
     entry->cv.notify_all(); // 唤醒所有等待者
 }
@@ -671,7 +673,20 @@ void FileSystem::releaseWriteLock(uint32_t inode_id) {
 // ============= 用户管理 =============
 
 bool FileSystem::addUser(const std::string& username, const std::string& password, bool is_root) {
-    uint16_t uid = users.size();
+    // 检查用户名是否已存在
+    for (const auto& pair : users) {
+        if (pair.second.username == username) {
+            std::cerr << "错误：用户 " << username << " 已存在" << std::endl;
+            return false;
+        }
+    }
+
+    // 找到一个未被占用的最小 UID
+    uint16_t uid = 0;
+    while (users.find(uid) != users.end()) {
+        ++uid;
+    }
+
     users[uid] = User(uid, username, password, is_root);
     return true;
 }
@@ -814,6 +829,12 @@ bool FileSystem::removeFile(const std::string& filename) {
     if (!readInode(file_inode_id, file_inode)) {
         return false;
     }
+
+    // 如果文件正在被写入，则禁止删除（跨进程保护）
+    if (file_inode.state == FILE_STATE_WRITING) {
+        std::cerr << "错误：文件正在被写入，暂时无法删除" << std::endl;
+        return false;
+    }
     
     // 检查权限
     if (!checkPermission(file_inode, PERM_WRITE)) {
@@ -911,20 +932,145 @@ bool FileSystem::writeFile(const std::string& filename, const std::string& conte
         std::cerr << "错误：没有写权限" << std::endl;
         return false;
     }
-    
-    // 获取写锁
+
+    // 先尝试基于磁盘状态的跨进程写锁
+    if (!beginWrite(file_inode_id)) {
+        // 另一个进程正在写同一文件
+        return false;
+    }
+
+    // 获取进程内写锁（非交互式场景直接在这里加锁）
     acquireWriteLock(file_inode_id);
-    
+
     // 写入数据
     bool result = writeInodeData(file_inode, content.c_str(), content.size());
     if (result) {
         writeInode(file_inode_id, file_inode);
         std::cout << "文件写入成功" << std::endl;
     }
+
+    // 释放进程内写锁
+    releaseWriteLock(file_inode_id);
+
+    // 释放跨进程写锁（将状态恢复为 AVAILABLE）
+    endWrite(file_inode_id);
+
+    return result;
+}
+
+bool FileSystem::beginWrite(uint32_t inode_id) {
+    // 从磁盘读取 inode 的最新状态
+    Inode inode;
+    if (!readInode(inode_id, inode)) {
+        return false;
+    }
+
+    // 检查文件是否已经被其他进程占用（跨进程写锁）
+    if (inode.state == FILE_STATE_WRITING) {
+        std::cerr << "错误：文件正在被其他进程写入，请稍后再试" << std::endl;
+        return false;
+    }
+
+    // 抢占写锁：设置状态为 WRITING 并写回磁盘
+    inode.state = FILE_STATE_WRITING;
+    if (!writeInode(inode_id, inode)) {
+        std::cerr << "错误：无法获取文件写锁" << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+void FileSystem::endWrite(uint32_t inode_id) {
+    // 从磁盘读取 inode
+    Inode inode;
+    if (!readInode(inode_id, inode)) {
+        return;
+    }
+
+    // 释放写锁：设置状态为 AVAILABLE 并写回磁盘
+    inode.state = FILE_STATE_AVAILABLE;
+    writeInode(inode_id, inode);
+}
+
+bool FileSystem::lockFileForWrite(const std::string& filename) {
+    if (!current_user) {
+        std::cerr << "错误：请先登录" << std::endl;
+        return false;
+    }
+
+    // 查找文件
+    uint32_t file_inode_id = findInodeByPath(filename);
+    if (file_inode_id == UINT32_MAX) {
+        std::cerr << "错误：文件不存在" << std::endl;
+        return false;
+    }
+
+    Inode file_inode;
+    if (!readInode(file_inode_id, file_inode)) {
+        return false;
+    }
+
+    // 检查写权限
+    if (!checkPermission(file_inode, PERM_WRITE)) {
+        std::cerr << "错误：没有写权限" << std::endl;
+        return false;
+    }
+
+    // 尝试获取跨进程写锁（基于磁盘状态）
+    if (!beginWrite(file_inode_id)) {
+        return false;
+    }
+
+    // 获取进程内写锁（如果已有写者或读者，这里会阻塞，直到可以写）
+    acquireWriteLock(file_inode_id);
+    return true;
+}
+
+void FileSystem::unlockFileForWrite(const std::string& filename) {
+    // 查找文件（如果文件已被删除则直接返回）
+    uint32_t file_inode_id = findInodeByPath(filename);
+    if (file_inode_id == UINT32_MAX) {
+        return;
+    }
     
-    // 释放写锁
+    // 释放进程内写锁
     releaseWriteLock(file_inode_id);
     
+    // 释放跨进程写锁（将磁盘状态改回 AVAILABLE）
+    endWrite(file_inode_id);
+}
+
+bool FileSystem::writeFileLocked(const std::string& filename, const std::string& content) {
+    if (!current_user) {
+        std::cerr << "错误：请先登录" << std::endl;
+        return false;
+    }
+
+    // 查找文件
+    uint32_t file_inode_id = findInodeByPath(filename);
+    if (file_inode_id == UINT32_MAX) {
+        std::cerr << "错误：文件不存在" << std::endl;
+        return false;
+    }
+
+    Inode file_inode;
+    if (!readInode(file_inode_id, file_inode)) {
+        return false;
+    }
+
+    // 再次检查写权限（防御性编程）
+    if (!checkPermission(file_inode, PERM_WRITE)) {
+        std::cerr << "错误：没有写权限" << std::endl;
+        return false;
+    }
+
+    bool result = writeInodeData(file_inode, content.c_str(), content.size());
+    if (result) {
+        writeInode(file_inode_id, file_inode);
+        std::cout << "文件写入成功" << std::endl;
+    }
+
     return result;
 }
 
@@ -943,6 +1089,12 @@ std::string FileSystem::readFile(const std::string& filename) {
     
     Inode file_inode;
     if (!readInode(file_inode_id, file_inode)) {
+        return "";
+    }
+
+    // 如果文件正在被写入，则禁止读取（跨进程保护 cat）
+    if (file_inode.state == FILE_STATE_WRITING) {
+        std::cerr << "错误：文件正在被写入，暂时无法读取" << std::endl;
         return "";
     }
     

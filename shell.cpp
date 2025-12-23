@@ -80,6 +80,8 @@ bool Shell::processCommand(const std::string& input) {
         cmdLogin();
     } else if (cmd == "logout") {
         cmdLogout();
+    } else if (cmd == "adduser") {
+        cmdAddUser();
     } else if (cmd == "ls") {
         cmdLs(tokens);
     } else if (cmd == "cd") {
@@ -126,6 +128,7 @@ void Shell::cmdHelp() {
     std::cout << "用户管理：" << std::endl;
     std::cout << "  login               - 用户登录" << std::endl;
     std::cout << "  logout              - 用户登出" << std::endl;
+    std::cout << "  adduser             - 注册新用户（仅 root）" << std::endl;
     std::cout << std::endl;
     
     std::cout << "文件操作：" << std::endl;
@@ -304,7 +307,13 @@ void Shell::cmdWrite(const std::vector<std::string>& args) {
         std::cout << "用法: write <file>" << std::endl;
         return;
     }
-    
+
+    // 在提示输入内容之前先获取写锁，这样可以在尝试 write 时就阻止其他写者
+    if (!fs->lockFileForWrite(args[1])) {
+        // 获取写锁失败（例如没有权限或文件不存在）
+        return;
+    }
+
     std::cout << "请输入文件内容（输入 EOF 结束）：" << std::endl;
     
     std::string content;
@@ -317,8 +326,15 @@ void Shell::cmdWrite(const std::vector<std::string>& args) {
         }
         content += line + "\n";
     }
-    
-    fs->writeFile(args[1], content);
+
+    // 在已持有写锁的前提下写入文件
+    bool ok = fs->writeFileLocked(args[1], content);
+    // 无论成功与否，都要释放写锁
+    fs->unlockFileForWrite(args[1]);
+
+    if (!ok) {
+        std::cout << "文件写入失败" << std::endl;
+    }
 }
 
 void Shell::cmdChmod(const std::vector<std::string>& args) {
@@ -344,6 +360,38 @@ void Shell::cmdChown(const std::vector<std::string>& args) {
     
     uint16_t uid = std::stoi(args[1]);
     fs->changeOwner(args[2], uid);
+}
+
+void Shell::cmdAddUser() {
+    // 只有 root 用户可以注册新用户
+    User* current = fs->getCurrentUser();
+    if (!current) {
+        std::cout << "错误：请先登录 root 用户" << std::endl;
+        return;
+    }
+    if (!current->is_root) {
+        std::cout << "错误：只有 root 用户可以注册新用户" << std::endl;
+        return;
+    }
+
+    std::string username;
+    std::string password;
+
+    std::cout << "新用户名: ";
+    std::getline(std::cin, username);
+    if (username.empty()) {
+        std::cout << "错误：用户名不能为空" << std::endl;
+        return;
+    }
+
+    std::cout << "新用户密码: ";
+    std::getline(std::cin, password);
+
+    if (fs->addUser(username, password, false)) {
+        std::cout << "用户 " << username << " 注册成功" << std::endl;
+    } else {
+        std::cout << "错误：用户注册失败" << std::endl;
+    }
 }
 
 void Shell::cmdInfo() {

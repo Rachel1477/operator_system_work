@@ -1,0 +1,323 @@
+1. 虚拟磁盘类 VirtualDisk
+功能说明：
+VirtualDisk 类负责把普通文件（如 disk.bin）抽象成块设备，为上层文件系统提供按块读写的接口。
+主要属性
+disk_filename：磁盘文件名，表示虚拟磁盘在宿主操作系统中的路径。
+disk_file：std::fstream 对象，负责实际的读写操作。
+主要方法
+VirtualDisk(const std::string& filename)：构造函数，打开或创建虚拟磁盘文件。
+~VirtualDisk()：析构函数，关闭磁盘文件。
+format()：对虚拟磁盘进行格式化，写入初始的超级块和位图等信息。
+readBlock(block_num, buffer)：从指定块号读取一个块到缓冲区。
+writeBlock(block_num, buffer)：把缓冲区的内容写入指定块。
+isOpen()：判断底层磁盘文件是否成功打开。
+```
+class VirtualDisk {
+private:
+    std::string disk_filename;
+    std::fstream disk_file;
+
+public:
+    VirtualDisk(const std::string& filename);
+    ~VirtualDisk();
+
+    bool format();  // 格式化磁盘
+    bool readBlock(uint32_t block_num, char* buffer);
+    bool writeBlock(uint32_t block_num, const char* buffer);
+    bool isOpen() const;
+};
+```
+2. 超级块结构体 SuperBlock
+功能说明：
+SuperBlock 用于描述整个文件系统的全局元数据，例如磁盘大小、块大小、Inode 数量及位图位置等，是挂载（mount）文件系统时首先加载的结构。
+主要属性
+magic_number：魔数，用于识别磁盘上是否是本文件系统。
+disk_size / block_size / total_blocks：磁盘总大小、块大小、总块数。
+total_inodes / free_inodes：Inode 总数与空闲数量。
+free_blocks：当前剩余的空闲数据块数。
+inode_bitmap_block / data_bitmap_block：Inode 位图和数据块位图在磁盘上的起始块号。
+inode_table_block：Inode 表在磁盘上的起始块号。
+data_block_start：真正用于存放文件数据的数据块起始位置。
+padding：填充字段，使结构体大小对齐到一个块（4096 字节）。
+```
+struct SuperBlock {
+    uint32_t magic_number;
+    uint32_t disk_size;
+    uint32_t block_size;
+    uint32_t total_blocks;
+    uint32_t total_inodes;
+    uint32_t free_blocks;
+    uint32_t free_inodes;
+    uint32_t inode_bitmap_block;
+    uint32_t data_bitmap_block;
+    uint32_t inode_table_block;
+    uint32_t data_block_start;
+    char padding[4052];
+
+    SuperBlock();
+};
+```
+3. Inode 结构体 Inode
+功能说明：
+Inode 是文件和目录的核心描述单元，记录对象的类型、大小、所属用户、权限以及数据所在的数据块等信息。
+主要属性
+inode_id：Inode 编号，在整个文件系统中唯一。
+file_type：文件类型（普通文件 / 目录），使用 FileType 枚举。
+permission：UNIX 风格的 rwx 权限位（owner/group/others）。
+owner_id：所有者用户的 UID。
+file_size：文件大小（字节数）。
+blocks_count：占用的数据块数量。
+direct_blocks[]：若干个直接块指针，指向真实数据块号。
+indirect_block：单级间接块指针，用于支持更大的文件。
+create_time / modify_time：创建时间和最后修改时间。
+padding：填充到固定大小（128 字节），便于顺序存储与寻址。
+```
+struct Inode {
+    uint32_t inode_id;
+    uint8_t  file_type;
+    uint16_t permission;
+    uint16_t owner_id;
+    uint32_t file_size;
+    uint32_t blocks_count;
+    uint32_t direct_blocks[DIRECT_BLOCKS];
+    uint32_t indirect_block;
+    uint32_t create_time;
+    uint32_t modify_time;
+    char     padding[36];
+
+    Inode();
+};
+```
+4. 目录项结构体 DirectoryEntry
+
+功能说明：
+DirectoryEntry 表示目录中的一条记录，用于建立“文件名 → Inode 编号”的映射。目录本质上是由多个目录项顺序组成的文件。
+主要属性
+filename：文件或子目录的名字，固定长度数组。
+inode_id：该名字对应的 Inode 编号。
+主要方法
+默认构造函数：初始化为空。
+DirectoryEntry(const char* name, uint32_t id)：根据名字和 Inode 编号创建目录项。
+```
+struct DirectoryEntry {
+    char     filename[MAX_FILENAME];
+    uint32_t inode_id;
+
+    DirectoryEntry();
+    DirectoryEntry(const char* name, uint32_t id);
+};
+```
+5. 用户结构体 User
+功能说明：
+User 描述系统中的一个用户，用于实现多用户和权限控制功能。
+主要属性
+uid：用户唯一标识（UID）。
+username：用户名。
+password：密码（项目中为简化，直接以明文字符串保存）。
+is_root：是否为超级用户 root，拥有最高权限。
+主要方法
+默认构造函数：创建普通用户（uid=0, 非 root）。
+带参构造函数：根据 UID、用户名、密码、是否 root 初始化用户。
+```
+struct User {
+    uint16_t    uid;
+    std::string username;
+    std::string password;
+    bool        is_root;
+
+    User();
+    User(uint16_t id, const std::string& name,
+         const std::string& pwd, bool root = false);
+};
+```
+6. 打开文件表项 OpenFileEntry
+功能说明：
+OpenFileEntry 记录一个 Inode 当前的打开状态，并通过读写锁实现简单的并发控制，避免多个线程同时写同一文件产生冲突。
+主要属性
+inode_id：对应的 Inode 编号。
+reader_count：当前正在读该文件的读者数量。
+is_writing：是否存在正在写该文件的写者。
+mutex：互斥锁，用于保护该结构。
+cv：条件变量，实现读写者之间的同步。
+主要方法
+默认构造函数：初始化为未打开状态（reader_count=0, is_writing=false）。
+```
+struct OpenFileEntry {
+    uint32_t inode_id;
+    int      reader_count;
+    bool     is_writing;
+    std::mutex              mutex;
+    std::condition_variable cv;
+
+    OpenFileEntry();
+};
+```
+7. 文件系统类 FileSystem
+功能说明：
+FileSystem 是核心类，封装了对虚拟磁盘的访问和所有文件系统操作（创建/删除文件、目录操作、权限控制、用户管理等），对外提供一个高级接口。
+主要属性
+disk：指向底层 VirtualDisk 对象，用于块级读写。
+super_block：内存中的超级块副本，记录全局元数据。
+inode_bitmap / data_bitmap：Inode 和数据块的位图，用于分配和回收资源。
+users：UID 到 User 的映射表，管理系统中所有用户。
+current_user：当前登录用户指针，实现会话概念。
+current_dir_inode / current_path：当前工作目录的 Inode 编号及其路径字符串。
+open_files：打开文件表（Inode 编号 → OpenFileEntry），支持并发读写。
+open_files_mutex：保护打开文件表的互斥锁。
+主要内部方法（私有）
+loadSuperBlock / saveSuperBlock：从磁盘加载/保存超级块。
+loadBitmaps / saveBitmaps：加载/保存位图。
+allocateInode / freeInode：分配/回收 Inode。
+allocateDataBlock / freeDataBlock：分配/回收数据块。
+readInode / writeInode：从磁盘读写 Inode。
+readInodeData / writeInodeData：根据 Inode 读写文件内容。
+addDirectoryEntry / removeDirectoryEntry / readDirectory：目录项的增删查。
+findInodeByPath：根据路径解析并找到对应的 Inode 编号。
+checkPermission：检查当前用户是否有指定权限。
+acquireReadLock / releaseReadLock / acquireWriteLock / releaseWriteLock：对某个 Inode 进行读写锁控制。
+主要外部方法（公有接口）
+format / mount：格式化并挂载文件系统。
+addUser / login / logout / getCurrentUser：用户管理和登录会话。
+createFile / createDirectory / removeFile / removeDirectory：文件与目录的创建与删除。
+writeFile / readFile：对普通文件进行内容读写。
+changeDirectory / listDirectory / getCurrentPath：目录切换、列出目录和获取当前路径。
+changePermission / changeOwner：修改权限和所有者。
+getFileInfo / permissionToString：用于显示文件信息和权限字符串。
+```
+class FileSystem {
+private:
+    VirtualDisk*     disk;
+    SuperBlock       super_block;
+    std::vector<bool> inode_bitmap;
+    std::vector<bool> data_bitmap;
+
+    // 用户管理
+    std::map<uint16_t, User> users;
+    User*                    current_user;
+
+    // 当前工作目录
+    uint32_t    current_dir_inode;
+    std::string current_path;
+
+    // 打开文件表（并发控制）
+    std::map<uint32_t, std::shared_ptr<OpenFileEntry>> open_files;
+    std::mutex                                         open_files_mutex;
+
+    // 内部辅助函数（加载/保存、分配/回收、目录操作、权限检查、并发控制等）
+    bool loadSuperBlock();
+    bool saveSuperBlock();
+    bool loadBitmaps();
+    bool saveBitmaps();
+    uint32_t allocateInode();
+    void     freeInode(uint32_t inode_id);
+    uint32_t allocateDataBlock();
+    void     freeDataBlock(uint32_t block_id);
+    bool readInode(uint32_t inode_id, Inode& inode);
+    bool writeInode(uint32_t inode_id, const Inode& inode);
+    bool readInodeData(const Inode& inode, char* buffer, uint32_t size);
+    bool writeInodeData(Inode& inode, const char* buffer, uint32_t size);
+    bool addDirectoryEntry(uint32_t dir_inode_id, const std::string& name, uint32_t inode_id);
+    bool removeDirectoryEntry(uint32_t dir_inode_id, const std::string& name);
+    std::vector<DirectoryEntry> readDirectory(uint32_t dir_inode_id);
+    uint32_t findInodeByPath(const std::string& path);
+    bool checkPermission(const Inode& inode, uint16_t required_perm);
+    void acquireReadLock(uint32_t inode_id);
+    void releaseReadLock(uint32_t inode_id);
+    void acquireWriteLock(uint32_t inode_id);
+    void releaseWriteLock(uint32_t inode_id);
+
+public:
+    FileSystem(const std::string& disk_file);
+    ~FileSystem();
+
+    // 初始化与挂载
+    bool format();
+    bool mount();
+
+    // 用户管理
+    bool addUser(const std::string& username, const std::string& password, bool is_root = false);
+    bool login(const std::string& username, const std::string& password);
+    void logout();
+    User* getCurrentUser() const;
+
+    // 文件操作
+    bool createFile(const std::string& filename);
+    bool createDirectory(const std::string& dirname);
+    bool removeFile(const std::string& filename);
+    bool removeDirectory(const std::string& dirname);
+    bool writeFile(const std::string& filename, const std::string& content);
+    std::string readFile(const std::string& filename);
+
+    // 目录操作
+    bool changeDirectory(const std::string& path);
+    std::vector<std::pair<std::string, Inode>> listDirectory(const std::string& path = ".");
+    std::string getCurrentPath() const;
+
+    // 权限管理
+    bool changePermission(const std::string& filename, uint16_t new_perm);
+    bool changeOwner(const std::string& filename, uint16_t new_owner);
+
+    // 辅助显示
+    std::string getFileInfo(const Inode& inode);
+    std::string permissionToString(uint16_t perm);
+};
+```
+8. 命令行界面类 Shell
+功能说明：
+Shell 类实现一个简单的命令行界面，为用户提供交互式操作环境。它负责读取用户输入、解析命令并调用 FileSystem 提供的接口来完成具体操作。
+主要属性
+fs：指向文件系统对象 FileSystem，所有命令都基于该实例执行。
+running：是否继续运行 shell 的标志。
+命令解析
+parseCommand(input)：将一行输入拆分为命令及参数列表。
+主要命令处理函数
+cmdHelp / cmdFormat / cmdMount / cmdLogin / cmdLogout：基础系统命令。
+cmdLs / cmdCd / cmdPwd / cmdMkdir / cmdTouch / cmdRm / cmdRmdir：常见文件与目录操作。
+cmdCat / cmdWrite：查看与写入文件内容。
+cmdChmod / cmdChown：修改权限和所有者。
+cmdInfo：显示文件系统整体信息（如剩余空间等）。
+cmdExit：退出 shell。
+辅助函数与外部接口
+printPrompt / getInput：显示提示符并读取用户输入。
+run()：主循环，不断读取命令并处理。
+processCommand(input)：对外暴露的单次命令处理函数，便于测试。
+```
+class Shell {
+private:
+    FileSystem* fs;
+    bool        running;
+
+    // 命令解析
+    std::vector<std::string> parseCommand(const std::string& input);
+
+    // 命令处理函数
+    void cmdHelp();
+    void cmdFormat();
+    void cmdMount();
+    void cmdLogin();
+    void cmdLogout();
+    void cmdLs(const std::vector<std::string>& args);
+    void cmdCd(const std::vector<std::string>& args);
+    void cmdPwd();
+    void cmdMkdir(const std::vector<std::string>& args);
+    void cmdTouch(const std::vector<std::string>& args);
+    void cmdRm(const std::vector<std::string>& args);
+    void cmdRmdir(const std::vector<std::string>& args);
+    void cmdCat(const std::vector<std::string>& args);
+    void cmdWrite(const std::vector<std::string>& args);
+    void cmdChmod(const std::vector<std::string>& args);
+    void cmdChown(const std::vector<std::string>& args);
+    void cmdInfo();
+    void cmdExit();
+
+    // 辅助函数
+    void        printPrompt();
+    std::string getInput();
+
+public:
+    Shell(FileSystem* filesystem);
+    ~Shell();
+
+    void run();
+    bool processCommand(const std::string& input);
+};

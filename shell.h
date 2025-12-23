@@ -30,6 +30,7 @@ private:
     void cmdWrite(const std::vector<std::string>& args);
     void cmdChmod(const std::vector<std::string>& args);
     void cmdChown(const std::vector<std::string>& args);
+    void cmdAddUser();
     void cmdInfo();
     void cmdExit();
     
